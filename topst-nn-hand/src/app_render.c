@@ -1,0 +1,384 @@
+#include "app_render.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+
+#include "opencv_api.h"
+
+static int hand_camera_square_crop_enabled(void)
+{
+    const char *mode = getenv("HAND_CAMERA_SQUARE_CROP");
+
+    if (mode == NULL || mode[0] == '\0') {
+        return 1;
+    }
+    return strcmp(mode, "0") != 0 && strcmp(mode, "off") != 0;
+}
+
+static void hand_model_to_camera_point(const app_context_t *app,
+                                       const model_context_t *model,
+                                       float mx,
+                                       float my,
+                                       float *cx,
+                                       float *cy)
+{
+    const float model_w = (model->input_width > 0) ? (float)model->input_width : (float)APP_HAND_MODEL_WIDTH;
+    const float model_h = (model->input_height > 0) ? (float)model->input_height : (float)APP_HAND_MODEL_HEIGHT;
+
+    if (app->input_mode == APP_INPUT_CAMERA &&
+        hand_camera_square_crop_enabled() &&
+        app->camera_width != app->camera_height) {
+        uint32_t crop = app->camera_width < app->camera_height ? app->camera_width : app->camera_height;
+        uint32_t left = (app->camera_width - crop) / 2u;
+        uint32_t top = (app->camera_height - crop) / 2u;
+
+        *cx = (float)left + (mx / model_w) * (float)crop;
+        *cy = (float)top + (my / model_h) * (float)crop;
+        return;
+    }
+
+    *cx = mx * ((float)app->camera_width / model_w);
+    *cy = my * ((float)app->camera_height / model_h);
+}
+
+static void draw_hand_pose_results(const app_context_t *app,
+                                   const model_context_t *model,
+                                   uint8_t *output_map_base,
+                                   Color_t color,
+                                   double box_font_size,
+                                   int box_label_offset)
+{
+    static const int bones[][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 4},
+        {0, 5}, {5, 6}, {6, 7}, {7, 8},
+        {0, 9}, {9, 10}, {10, 11}, {11, 12},
+        {0, 13}, {13, 14}, {14, 15}, {15, 16},
+        {0, 17}, {17, 18}, {18, 19}, {19, 20},
+    };
+    const float sx = (float)app->display_width / (float)app->camera_width;
+    const float sy = (float)app->display_height / (float)app->camera_height;
+    const hand_pose_objs_t *hands = &model->hand_result;
+    int hand_count = hands->cnt;
+
+    if (hand_count > APP_HAND_MAX_DET) {
+        hand_count = APP_HAND_MAX_DET;
+    }
+    if (hand_count > 64) {
+        hand_count = 64;
+    }
+
+    for (int i = 0; i < hand_count; ++i) {
+        const hand_pose_obj_t *hand = &hands->obj[i];
+        Box_t box;
+        Point_t points[APP_HAND_NUM_KPT];
+        Point_t line_start[20];
+        Point_t line_end[20];
+        int valid[APP_HAND_NUM_KPT];
+        int line_count = 0;
+        float x1;
+        float y1;
+        float x2;
+        float y2;
+
+        hand_model_to_camera_point(app, model, hand->x1, hand->y1, &x1, &y1);
+        hand_model_to_camera_point(app, model, hand->x2, hand->y2, &x2, &y2);
+        box.cls = 0;
+        box.track_id = i;
+        box.score = hand->conf;
+        box.xmin = (int)(x1 + 0.5f);
+        box.ymin = (int)(y1 + 0.5f);
+        box.xmax = (int)(x2 + 0.5f);
+        box.ymax = (int)(y2 + 0.5f);
+        cvDrawBoxes(output_map_base, &box, 1,
+                    app->display_width, app->display_height,
+                    app->camera_width, app->camera_height,
+                    color, color, box_font_size, box_label_offset);
+
+        for (int k = 0; k < APP_HAND_NUM_KPT; ++k) {
+            float cx;
+            float cy;
+            int px;
+            int py;
+
+            hand_model_to_camera_point(app, model,
+                                       hand->kpts[k][0],
+                                       hand->kpts[k][1],
+                                       &cx, &cy);
+            px = (int)(cx * sx + 0.5f);
+            py = (int)(cy * sy + 0.5f);
+
+            if (px < 0) {
+                px = 0;
+            } else if (px >= (int)app->display_width) {
+                px = (int)app->display_width - 1;
+            }
+            if (py < 0) {
+                py = 0;
+            } else if (py >= (int)app->display_height) {
+                py = (int)app->display_height - 1;
+            }
+
+            points[k].x = px;
+            points[k].y = py;
+            valid[k] = (hand->kpts[k][2] >= 0.25f);
+        }
+
+        for (size_t b = 0; b < sizeof(bones) / sizeof(bones[0]); ++b) {
+            int a = bones[b][0];
+            int c = bones[b][1];
+
+            if (!valid[a] || !valid[c]) {
+                continue;
+            }
+            line_start[line_count] = points[a];
+            line_end[line_count] = points[c];
+            line_count++;
+        }
+
+        if (line_count > 0) {
+            cvDrawLines(output_map_base, app->display_width, app->display_height,
+                        line_start, line_end, line_count, color, 2);
+        }
+        cvDrawPoints(output_map_base, app->display_width, app->display_height,
+                     points, APP_HAND_NUM_KPT, 3, RGB(255, 255, 255));
+    }
+}
+
+static void overlay_results(app_context_t *app, uint8_t *output_map_base)
+{
+    static const Color_t colors[APP_MAX_MODELS] = {
+        RGB(80, 255, 120),
+        RGB(80, 255, 120),
+    };
+    const int compact_ui = (app->display_width <= 800 || app->display_height <= 480);
+    const int left_overlay_margin = compact_ui ? 28 : 36;
+    const int right_overlay_margin = compact_ui ? -2 : 6;
+    const int perf_line_step = compact_ui ? 22 : 18;
+    const int perf_group_gap = compact_ui ? 6 : 2;
+    const int perf_column_width = compact_ui ? 125 : 200;
+    const double perf_font_size = compact_ui ? 0.4 : 0.8;
+    const double box_font_size = compact_ui ? 0.5 : 0.8;
+    const int box_label_offset = compact_ui ? 8 : 5;
+    const double cls_font_size = compact_ui ? 0.4 : 0.8;
+    int i;
+    int info_x;
+    int info_y = compact_ui ? 40 : 36;
+
+    if (output_map_base == NULL || output_map_base == MAP_FAILED) {
+        return;
+    }
+
+    /* 네트워크별 결과를 한 화면에 겹쳐 그리기 위해 공통 오버레이 좌표를 계산한다. */
+    info_x = (int)app->display_width - perf_column_width - right_overlay_margin;
+    if (info_x < left_overlay_margin) {
+        info_x = left_overlay_margin;
+    }
+
+    for (i = 0; i < app->model_count; ++i) {
+        const model_context_t *model = &app->models[i];
+        Color_t color = colors[i];
+
+        if (model->post_type == TELECHIPS_NPU_POST_DETECTOR ||
+            (model->post_type == TELECHIPS_NPU_POST_CUSTOM &&
+             model->custom_result_kind == APP_CUSTOM_RESULT_FACE)) {
+            /* detector와 face custom은 tracker가 보정한 박스를 사용해 화면에 그린다. */
+            int j;
+            Box_t boxes[256];
+            int box_count = model->tracked_result.count;
+
+            if (box_count > 256) {
+                box_count = 256;
+            }
+            for (j = 0; j < box_count; ++j) {
+                const tracked_object_t *obj = &model->tracked_result.objects[j];
+                boxes[j].cls = obj->cls;
+                boxes[j].track_id = obj->track_id;
+                boxes[j].score = obj->score;
+                boxes[j].xmin = (int)(obj->x_min + 0.5f);
+                boxes[j].ymin = (int)(obj->y_min + 0.5f);
+                boxes[j].xmax = (int)(obj->x_max + 0.5f);
+                boxes[j].ymax = (int)(obj->y_max + 0.5f);
+            }
+            if (box_count > 0) {
+                int box_image_width = (int)app->camera_width;
+                int box_image_height = (int)app->camera_height;
+
+                if (box_image_width <= 0) {
+                    box_image_width = (int)app->camera_width;
+                }
+                if (box_image_height <= 0) {
+                    box_image_height = (int)app->camera_height;
+                }
+
+                cvDrawBoxes(output_map_base, boxes, box_count,
+                            app->display_width, app->display_height,
+                            (uint32_t)box_image_width,
+                            (uint32_t)box_image_height,
+                            color, color, box_font_size, box_label_offset);
+            }
+        } else if (model->post_type == TELECHIPS_NPU_POST_CUSTOM &&
+                   model->custom_result_kind == APP_CUSTOM_RESULT_HAND) {
+            draw_hand_pose_results(app, model, output_map_base,
+                                   color, box_font_size, box_label_offset);
+        } else if (model->post_type == TELECHIPS_NPU_POST_CUSTOM) {
+            /* lane 결과는 모델 좌표계를 디스플레이 좌표계로 변환해 선분으로 그린다. */
+            static const Color_t lane_colors[6] = {
+                RGB(255, 0, 0),
+                RGB(0, 255, 0),
+                RGB(0, 255, 255),
+                RGB(255, 255, 0),
+                RGB(255, 0, 255),
+                RGB(255, 255, 255),
+            };
+            const laneaf_result_t *res = model->lane_data;
+            int lane_idx;
+
+            if (model->custom_result_kind != APP_CUSTOM_RESULT_LANE) {
+                continue;
+            }
+            if (res == NULL) {
+                continue;
+            }
+
+            for (lane_idx = 0; lane_idx < res->num_lanes && lane_idx < MAX_LANES; ++lane_idx) {
+                const lane_polyline_t *ln = &res->lane[lane_idx];
+                Point_t line_start[MAX_POINTS - 1];
+                Point_t line_end[MAX_POINTS - 1];
+                Color_t lane_color = lane_colors[lane_idx % 6];
+                int line_count = 0;
+                int prev_valid = 0;
+                int prev_x = 0;
+                int prev_y = 0;
+                int p;
+
+                if (ln->n < 2) {
+                    continue;
+                }
+
+                for (p = 0; p < ln->n && p < MAX_POINTS; ++p) {
+                    int x = (int)((ln->x[p] / (float)res->img_w) * (float)app->display_width + 0.5f);
+                    int y = (int)((ln->y[p] / (float)res->img_h) * (float)app->display_height + 0.5f);
+                    int clamped_x = x < 0 ? 0 : x;
+                    int clamped_y = y < 0 ? 0 : y;
+
+                    if (prev_valid) {
+                        line_start[line_count].x = prev_x;
+                        line_start[line_count].y = prev_y;
+                        line_end[line_count].x = clamped_x;
+                        line_end[line_count].y = clamped_y;
+                        ++line_count;
+                    }
+                    prev_x = clamped_x;
+                    prev_y = clamped_y;
+                    prev_valid = 1;
+                }
+
+                if (line_count > 0) {
+                    cvDrawLines(output_map_base, app->display_width, app->display_height,
+                                line_start, line_end, line_count, lane_color, 3);
+                }
+            }
+        } else if (model->post_type == TELECHIPS_NPU_POST_CLASSIFIER) {
+            cvDrawCls(output_map_base, app->display_width, app->display_height,
+                      model->cls_result.class_ids[0], left_overlay_margin, 40 + i * 30,
+                      color, cls_font_size);
+        }
+
+        cvDrawInfo(output_map_base, app->display_width, app->display_height,
+                   DRAW_INFO_NETWORK, model->perf.elapsed_in_us / 1000.0,
+                   model->index, info_x, info_y, perf_font_size, color);
+        info_y += perf_line_step;
+        cvDrawInfo(output_map_base, app->display_width, app->display_height,
+                   DRAW_INFO_NPU, model->npuUtilization,
+                   model->index, info_x, info_y, perf_font_size, color);
+        info_y += perf_line_step + perf_group_gap;
+    }
+
+    /* 마지막에 시스템 공통 정보(FPS/CPU/MEM)를 별도 영역에 표시한다. */
+    cvDrawInfo(output_map_base, app->display_width, app->display_height,
+               DRAW_INFO_FPS, app->perf.fps,
+               0, left_overlay_margin, compact_ui ? 40 : 36, perf_font_size, RGB(255, 255, 255));
+    cvDrawInfo(output_map_base, app->display_width, app->display_height,
+               DRAW_INFO_CPU, app->perf.cpuUtil[0],
+               0, info_x, info_y, perf_font_size, RGB(255, 255, 255));
+    info_y += perf_line_step;
+    cvDrawInfo(output_map_base, app->display_width, app->display_height,
+               DRAW_INFO_MEMORY, app->perf.memUsage,
+               0, info_x, info_y, perf_font_size, RGB(255, 255, 255));
+}
+
+int render_output_frame(app_context_t *app)
+{
+    int output_idx = app->display_buffer_index % APP_DISPLAY_BUFFER_COUNT;
+
+    if (app->memory.map_base_output[output_idx] == NULL ||
+        app->memory.map_base_output[output_idx] == MAP_FAILED) {
+        fprintf(stderr, "invalid output buffer mapping: %d\n", output_idx);
+        return -1;
+    }
+
+    if (app->input_mode == APP_INPUT_CAMERA) {
+        /* 카메라 입력은 현재 캡처 버퍼를 그대로 디스플레이 해상도로 축소한다. */
+        scaler_image_t src;
+        scaler_image_t dst;
+
+        memset(&src, 0, sizeof(src));
+        memset(&dst, 0, sizeof(dst));
+        src.paddr = app->camera_phys_addr;
+        src.width = app->camera_width;
+        src.height = app->camera_height;
+        src.format = SCALER_FORMAT_ARGB8888;
+
+        dst.paddr = app->memory.phy_base_output[output_idx];
+        dst.width = app->display_width;
+        dst.height = app->display_height;
+        dst.format = SCALER_FORMAT_RGB888;
+
+        if (scaler_resize(app->scaler, SCALER_INDEX_0, src, dst) != 0) {
+            return -1;
+        }
+        if (scaler_poll(app->scaler, SCALER_INDEX_0) != 0) {
+            return -1;
+        }
+    } else {
+        /* TCP 입력은 staging buffer를 기준으로 디스플레이용 프레임을 만든다. */
+        scaler_image_t src;
+        scaler_image_t dst;
+
+        if (app->tcp_stage_buf == NULL) {
+            return -1;
+        }
+
+        memset(&src, 0, sizeof(src));
+        memset(&dst, 0, sizeof(dst));
+        src.paddr = app->tcp_stage_buf->paddr;
+        src.width = app->camera_width;
+        src.height = app->camera_height;
+        src.format = SCALER_FORMAT_RGB888;
+
+        dst.paddr = app->memory.phy_base_output[output_idx];
+        dst.width = app->display_width;
+        dst.height = app->display_height;
+        dst.format = SCALER_FORMAT_RGB888;
+
+        if (scaler_resize(app->scaler, SCALER_INDEX_0, src, dst) != 0) {
+            return -1;
+        }
+        if (scaler_poll(app->scaler, SCALER_INDEX_0) != 0) {
+            return -1;
+        }
+    }
+
+    /* 축소된 배경 영상 위에 detector/lane/perf 정보를 덧그린다. */
+    overlay_results(app, app->memory.map_base_output[output_idx]);
+
+    /* 완성된 출력 버퍼를 overlay/display 장치에 실제로 보여준다. */
+    if (display_show(app->display, app->memory.phy_base_output[output_idx], app->display_x,
+                     app->display_y, app->display_width, app->display_height) != 0) {
+        return -1;
+    }
+
+    app->display_buffer_index++;
+    return 0;
+}
