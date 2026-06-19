@@ -28,7 +28,7 @@ sudo add-apt-repository ppa:deadsnakes/ppa -y
 sudo apt install -y python3.8 python3.8-venv python3.8-dev python3.8-tk
 
 cd ai-edu-kit
-wget https://topst-downloads.s3.ap-northeast-2.amazonaws.com/Education/zonal-architecture-kit/tc-nn-toolkit.zip
+wget https://topst-downloads.s3.ap-northeast-2.amazonaws.com/Education/AI_Robot_Edu/tc-nn-toolkit.zip
 unzip tc-nn-toolkit.zip
 cd tc-nn-toolkit
 python3.8 -m venv ./venv
