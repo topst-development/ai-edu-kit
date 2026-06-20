@@ -1,4 +1,4 @@
-TARGET = topst-nn-server
+TARGET = topst-nn-hand
 BUILD_DIR := build
 OBJDIR := $(BUILD_DIR)/obj
 DEPDIR := $(BUILD_DIR)/dep
