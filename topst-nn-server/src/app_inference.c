@@ -2,6 +2,9 @@
 
 #include "app_inference.h"
 
+#include "custom_postproc.h"
+
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -162,24 +165,70 @@ void *run_inference_thread(void *arg)
     return NULL;
 }
 
+static int run_postprocess(model_context_t *model, void *result)
+{
+    int ret;
+    int saved_stdout = -1;
+    int null_fd = -1;
+
+    if (!model->verbose) {
+        fflush(stdout);
+        saved_stdout = dup(STDOUT_FILENO);
+        null_fd = open("/dev/null", O_WRONLY);
+        if (saved_stdout >= 0 && null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+        }
+    }
+
+    ret = network_run_postprocess(model->net, model->output_buf, result);
+
+    if (saved_stdout >= 0) {
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)close(saved_stdout);
+    }
+    if (null_fd >= 0) {
+        (void)close(null_fd);
+    }
+
+    return ret;
+}
+
 int postprocess_model(model_context_t *model)
 {
     /* 네트워크 타입에 맞춰 후처리 호출 */
     if (model->post_type == TELECHIPS_NPU_POST_DETECTOR) {
+        int ret;
+        if (model->verbose) { fprintf(stderr, "[stage] postprocess model%d detector begin\n", model->index); fflush(stderr); }
         memset(&model->det_result, 0, sizeof(model->det_result));
-        return network_run_postprocess(model->net, model->output_buf,
-                                       &model->det_result);
+        ret = run_postprocess(model, &model->det_result);
+        if (model->verbose) { fprintf(stderr, "[stage] postprocess model%d detector done ret=%d cnt=%d\n", model->index, ret, model->det_result.cnt); fflush(stderr); }
+        return ret;
     }
     if (model->post_type == TELECHIPS_NPU_POST_CLASSIFIER) {
+        int ret;
+        if (model->verbose) { fprintf(stderr, "[stage] postprocess model%d classifier begin\n", model->index); fflush(stderr); }
         memset(&model->cls_result, 0, sizeof(model->cls_result));
-        return network_run_postprocess(model->net, model->output_buf,
-                                       &model->cls_result);
+        ret = run_postprocess(model, &model->cls_result);
+        if (model->verbose) { fprintf(stderr, "[stage] postprocess model%d classifier done ret=%d class=%d\n", model->index, ret, model->cls_result.class_ids[0]); fflush(stderr); }
+        return ret;
     }
     if (model->post_type == TELECHIPS_NPU_POST_CUSTOM) {
+        int ret;
+        if (model->verbose) { fprintf(stderr, "[stage] postprocess model%d custom begin\n", model->index); fflush(stderr); }
+        model->custom_output.data = (model->output_buf != NULL) ? model->output_buf->caddr : NULL;
+        model->custom_output.size = (model->output_buf != NULL) ? model->output_buf->size : 0;
         model->lane_data = NULL;
-        return network_run_postprocess(model->net, model->output_buf,
-                                       &model->lane_data);
+        ret = network_run_postprocess(model->net, model->output_buf, &model->lane_data);
+        if (model->verbose) {
+            int lanes = (model->lane_data != NULL) ? model->lane_data->num_lanes : -1;
+            fprintf(stderr, "[stage] postprocess model%d custom done ret=%d lanes=%d bytes=%d\n", model->index, ret, lanes, model->custom_output.size);
+            fflush(stderr);
+        }
+        return ret;
     }
 
+    model->custom_output.data = NULL;
+    model->custom_output.size = 0;
     return 0;
 }

@@ -2,6 +2,8 @@
 
 #include "app_json.h"
 
+#include "app_vision.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -87,6 +89,9 @@ static int json_output_start(json_output_context_t *ctx, int port)
 
 int app_json_init(app_context_t *app)
 {
+    if (app->input_mode == APP_INPUT_TCP || app->input_mode == APP_INPUT_VISION) {
+        return 0;
+    }
     return json_output_start(&app->json_output, app->json_output.port);
 }
 
@@ -108,7 +113,8 @@ void app_json_poll_accept(app_context_t *app)
     socklen_t cli_len = sizeof(cli_addr);
     int cfd;
 
-    if (app->json_output.server_fd < 0) {
+    if (app->input_mode == APP_INPUT_TCP || app->input_mode == APP_INPUT_VISION ||
+        app->json_output.server_fd < 0) {
         return;
     }
 
@@ -128,16 +134,19 @@ void app_json_poll_accept(app_context_t *app)
 int app_json_send_results(app_context_t *app)
 {
     char json_buf[32768];
+
+    if (!app->json_enabled) {
+        return 0;
+    }
     int i;
     int pos = 0;
     int first = 1;
     ssize_t sent;
 
-    if (app->json_output.client_fd < 0) {
+    if (app->input_mode != APP_INPUT_VISION && app->json_output.client_fd < 0) {
         return 0;
     }
 
-    /* 프레임 1장의 결과를 줄바꿈(\n)으로 끝나는 JSON 한 줄로 직렬화 */
     if (append_json(json_buf, sizeof(json_buf), &pos,
                     "{\"frame_index\":%llu,\"width\":%u,\"height\":%u,",
                     (unsigned long long)app->frame_index,
@@ -173,6 +182,29 @@ int app_json_send_results(app_context_t *app)
         }
     }
 
+    if (append_json(json_buf, sizeof(json_buf), &pos, "],\"classes\":[") < 0) {
+        return -1;
+    }
+
+    first = 1;
+    for (i = 0; i < APP_MAX_MODELS; ++i) {
+        const model_context_t *model = &app->models[i];
+
+        if (model->post_type != TELECHIPS_NPU_POST_CLASSIFIER) {
+            continue;
+        }
+
+        if (!first && append_json(json_buf, sizeof(json_buf), &pos, ",") < 0) {
+            return -1;
+        }
+        first = 0;
+        if (append_json(json_buf, sizeof(json_buf), &pos,
+                        "{\"model\":%d,\"class_id\":%d}",
+                        model->index, model->cls_result.class_ids[0]) < 0) {
+            return -1;
+        }
+    }
+
     if (append_json(json_buf, sizeof(json_buf), &pos, "],\"lanes\":[") < 0) {
         return -1;
     }
@@ -180,24 +212,21 @@ int app_json_send_results(app_context_t *app)
     first = 1;
     for (i = 0; i < APP_MAX_MODELS; ++i) {
         const model_context_t *model = &app->models[i];
+        const laneaf_result_t *lane_data = model->lane_data;
         int lane_idx;
 
-        if (model->post_type != TELECHIPS_NPU_POST_CUSTOM) {
-            continue;
-        }
-        if (model->lane_data == NULL) {
+        if (model->post_type != TELECHIPS_NPU_POST_CUSTOM || lane_data == NULL) {
             continue;
         }
 
-        for (lane_idx = 0; lane_idx < model->lane_data->num_lanes && lane_idx < MAX_LANES; ++lane_idx) {
-            int p;
-            int lane_open = 0;
-            const lane_polyline_t *ln = &model->lane_data->lane[lane_idx];
-            const int lane_src_w = (model->lane_data->img_w > 0) ? model->lane_data->img_w : (int)app->camera_width;
-            const int lane_src_h = (model->lane_data->img_h > 0) ? model->lane_data->img_h : (int)app->camera_height;
-            /* 차선 후처리 결과는 모델 고유 해상도일 수 있으므로 여기서 카메라 픽셀 기준으로 다시 맞춘다. */
+        for (lane_idx = 0; lane_idx < lane_data->num_lanes && lane_idx < MAX_LANES; ++lane_idx) {
+            const lane_polyline_t *ln = &lane_data->lane[lane_idx];
+            const int lane_src_w = (lane_data->img_w > 0) ? lane_data->img_w : (int)app->camera_width;
+            const int lane_src_h = (lane_data->img_h > 0) ? lane_data->img_h : (int)app->camera_height;
             const float lane_sx = (float)app->camera_width / (float)((lane_src_w > 0) ? lane_src_w : 1);
             const float lane_sy = (float)app->camera_height / (float)((lane_src_h > 0) ? lane_src_h : 1);
+            int lane_open = 0;
+            int p;
 
             if (!first && append_json(json_buf, sizeof(json_buf), &pos, ",") < 0) {
                 return -1;
@@ -218,7 +247,8 @@ int app_json_send_results(app_context_t *app)
                     }
                     lane_open = 1;
                     if (append_json(json_buf, sizeof(json_buf), &pos,
-                                    "{\"x\":%d,\"y\":%d,\"conf\":%.3f}", x, y, ln->conf[p]) < 0) {
+                                    "{\"x\":%d,\"y\":%d,\"conf\":%.3f}",
+                                    x, y, ln->conf[p]) < 0) {
                         return -1;
                     }
                 }
@@ -230,10 +260,37 @@ int app_json_send_results(app_context_t *app)
         }
     }
 
+    if (append_json(json_buf, sizeof(json_buf), &pos, "],\"custom_outputs\":[") < 0) {
+        return -1;
+    }
+
+    first = 1;
+    for (i = 0; i < APP_MAX_MODELS; ++i) {
+        const model_context_t *model = &app->models[i];
+
+        if (model->post_type != TELECHIPS_NPU_POST_CUSTOM) {
+            continue;
+        }
+
+        if (!first && append_json(json_buf, sizeof(json_buf), &pos, ",") < 0) {
+            return -1;
+        }
+        first = 0;
+        if (append_json(json_buf, sizeof(json_buf), &pos,
+                        "{\"model\":%d,\"format\":\"raw\",\"bytes\":%d}",
+                        model->index, model->custom_output.size) < 0) {
+            return -1;
+        }
+    }
+
     if (append_json(json_buf, sizeof(json_buf), &pos,
                     "],\"perf\":{\"fps\":%.2f,\"cpu\":%u,\"mem\":%u}}\n",
                     app->perf.fps, app->perf.cpuUtil[0], app->perf.memUsage) < 0) {
         return -1;
+    }
+
+    if (app->input_mode == APP_INPUT_TCP || app->input_mode == APP_INPUT_VISION) {
+        return app_vision_send_result_json(app, json_buf, (size_t)pos);
     }
 
     sent = send(app->json_output.client_fd, json_buf, (size_t)pos, MSG_NOSIGNAL);

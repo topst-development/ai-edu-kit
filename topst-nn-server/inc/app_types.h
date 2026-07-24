@@ -23,6 +23,12 @@
 #define DEFAULT_DISPLAY_HEIGHT 480
 #define DEFAULT_TCP_PORT 9999
 #define DEFAULT_JSON_PORT 9998
+#define DEFAULT_VISION_STREAM_PORT 9998
+#define DEFAULT_VISION_MESSAGE_PORT 9999
+#define DEFAULT_VISION_TARGET_IP "192.168.0.8"
+#define DEFAULT_TCP_VISION_TARGET_IP "192.168.0.101"
+#define DEFAULT_MODEL0_DIR "/usr/share/mobilenetv2_10_quantized"
+#define DEFAULT_MODEL1_DIR "/usr/share/yolov8s_quantized"
 #define CPU_CORE_NUM 4
 #define CPU_CORE_NUM_MAX 5
 #define CPU_STAT_MAX 4
@@ -67,6 +73,11 @@ typedef struct {
 } tracked_object_t;
 
 typedef struct {
+    const void *data;
+    int size;
+} custom_output_t;
+
+typedef struct {
     int count;
     tracked_object_t objects[APP_MAX_TRACKS];
 } tracked_objects_t;
@@ -102,6 +113,7 @@ typedef struct {
 typedef enum {
     APP_INPUT_CAMERA = 0,
     APP_INPUT_TCP,
+    APP_INPUT_VISION,
 } app_input_mode_t;
 
 typedef struct {
@@ -117,6 +129,19 @@ typedef struct {
     int client_fd;
     int port;
 } json_output_context_t;
+
+typedef struct {
+    void *handle;
+    char target_ip[64];
+    int stream_port;
+    int message_port;
+    size_t frame_bytes;
+    uint64_t recv_phys[APP_PMAP_SPLIT_NUMBER];
+    uint8_t *active_frame;
+    uint64_t active_phys;
+    uint64_t active_sync;
+    uint64_t result_seq;
+} vision_transport_context_t;
 
 typedef struct {
     int index;
@@ -139,6 +164,8 @@ typedef struct {
     enlight_objs_t det_result;
     tracked_objects_t tracked_result;
     enlight_batch_cls_t cls_result;
+    custom_output_t custom_output;
+    laneaf_result_t laneaf_result;
     laneaf_result_t *lane_data;
 } model_context_t;
 
@@ -177,6 +204,7 @@ typedef struct {
     uint64_t frame_index;
     tcp_input_context_t tcp_input;
     json_output_context_t json_output;
+    vision_transport_context_t vision;
 
     model_context_t models[APP_MAX_MODELS];
     sort_tracker_t trackers[APP_MAX_MODELS];
@@ -192,3 +220,5 @@ typedef struct {
 const char *input_mode_to_string(app_input_mode_t mode);
 
 #endif
+
+

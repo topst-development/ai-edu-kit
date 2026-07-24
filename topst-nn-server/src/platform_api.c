@@ -88,7 +88,7 @@ int camera_open_device(camera_handle_t handle, const char *device_path)
         return -1;
     }
 
-    ctx->fd = open(device_path, O_RDWR);
+    ctx->fd = open(device_path, O_RDWR | O_NONBLOCK);
     if (ctx->fd < 0) {
         return -1;
     }
