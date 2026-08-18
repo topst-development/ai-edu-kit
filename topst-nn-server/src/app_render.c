@@ -1,6 +1,5 @@
 #include "app_render.h"
 #include "app_vision.h"
-#include "custom_postproc.h"
 
 #include <sys/mman.h>
 
@@ -33,7 +32,7 @@ static void overlay_results(app_context_t *app, uint8_t *output_map_base)
         return;
     }
 
-    /* ??????????????????????? ???????? ??? ?????? ???????????. */
+    /* 네트워크별 결과를 한 화면에 겹쳐 그리기 위해 공통 오버레이 좌표를 계산한다. */
     info_x = (int)app->display_width - perf_column_width - right_overlay_margin;
     if (info_x < left_overlay_margin) {
         info_x = left_overlay_margin;
@@ -44,7 +43,7 @@ static void overlay_results(app_context_t *app, uint8_t *output_map_base)
         Color_t color = colors[i];
 
         if (model->post_type == TELECHIPS_NPU_POST_DETECTOR) {
-            /* detector??tracker?? ????????????????????????? */
+            /* detector는 tracker가 보정한 박스를 사용해 화면에 그린다. */
             int j;
             Box_t boxes[256];
             int box_count = model->tracked_result.count;
@@ -80,7 +79,60 @@ static void overlay_results(app_context_t *app, uint8_t *output_map_base)
                             color, color, box_font_size, box_label_offset);
             }
         } else if (model->post_type == TELECHIPS_NPU_POST_CUSTOM) {
-            app_custom_postproc_render(app, model, output_map_base);
+            /* lane 결과는 모델 좌표계를 디스플레이 좌표계로 변환해 선분으로 그린다. */
+            static const Color_t lane_colors[6] = {
+                RGB(255, 0, 0),
+                RGB(0, 255, 0),
+                RGB(0, 255, 255),
+                RGB(255, 255, 0),
+                RGB(255, 0, 255),
+                RGB(255, 255, 255),
+            };
+            const laneaf_result_t *res = model->lane_data;
+            int lane_idx;
+
+            if (res == NULL) {
+                continue;
+            }
+
+            for (lane_idx = 0; lane_idx < res->num_lanes && lane_idx < MAX_LANES; ++lane_idx) {
+                const lane_polyline_t *ln = &res->lane[lane_idx];
+                Point_t line_start[MAX_POINTS - 1];
+                Point_t line_end[MAX_POINTS - 1];
+                Color_t lane_color = lane_colors[lane_idx % 6];
+                int line_count = 0;
+                int prev_valid = 0;
+                int prev_x = 0;
+                int prev_y = 0;
+                int p;
+
+                if (ln->n < 2) {
+                    continue;
+                }
+
+                for (p = 0; p < ln->n && p < MAX_POINTS; ++p) {
+                    int x = (int)((ln->x[p] / (float)res->img_w) * (float)app->display_width + 0.5f);
+                    int y = (int)((ln->y[p] / (float)res->img_h) * (float)app->display_height + 0.5f);
+                    int clamped_x = x < 0 ? 0 : x;
+                    int clamped_y = y < 0 ? 0 : y;
+
+                    if (prev_valid) {
+                        line_start[line_count].x = prev_x;
+                        line_start[line_count].y = prev_y;
+                        line_end[line_count].x = clamped_x;
+                        line_end[line_count].y = clamped_y;
+                        ++line_count;
+                    }
+                    prev_x = clamped_x;
+                    prev_y = clamped_y;
+                    prev_valid = 1;
+                }
+
+                if (line_count > 0) {
+                    cvDrawLines(output_map_base, app->display_width, app->display_height,
+                                line_start, line_end, line_count, lane_color, 3);
+                }
+            }
         } else if (model->post_type == TELECHIPS_NPU_POST_CLASSIFIER) {
             cvDrawCls(output_map_base, app->display_width, app->display_height,
                       model->cls_result.class_ids[0], left_overlay_margin, cls_start_y + i * cls_line_step,
@@ -97,7 +149,7 @@ static void overlay_results(app_context_t *app, uint8_t *output_map_base)
         info_y += perf_line_step + perf_group_gap;
     }
 
-    /* ?????? ???????? ???(FPS/CPU/MEM)????? ???????????. */
+    /* 마지막에 시스템 공통 정보(FPS/CPU/MEM)를 별도 영역에 표시한다. */
     cvDrawInfo(output_map_base, app->display_width, app->display_height,
                DRAW_INFO_FPS, app->perf.fps,
                0, left_overlay_margin, fps_y, perf_font_size, RGB(255, 255, 255));
@@ -121,7 +173,7 @@ int render_output_frame(app_context_t *app)
     }
 
     if (app->input_mode == APP_INPUT_CAMERA) {
-        /* ?????????? ??? ??? ???????????????????????? ??????. */
+        /* 카메라 입력은 현재 캡처 버퍼를 그대로 디스플레이 해상도로 축소한다. */
         scaler_image_t src;
         scaler_image_t dst;
 
@@ -142,11 +194,10 @@ int render_output_frame(app_context_t *app)
             return -1;
         }
     } else {
-        /* ?? ??? TCP staging ?? Vision Protocol ?? ?? ??? ????. */
         scaler_image_t src;
         scaler_image_t dst;
 
-        if (app->input_mode == APP_INPUT_TCP || app->input_mode == APP_INPUT_VISION) {
+        if (app->input_mode == APP_INPUT_VISION) {
             uint64_t frame_phys = app_vision_frame_phys(app);
             if (frame_phys == 0) {
                 return -1;
@@ -177,10 +228,10 @@ int render_output_frame(app_context_t *app)
         }
     }
 
-    /* ???????? ??? ??? detector/lane/perf ???????????. */
+    /* 축소된 배경 영상 위에 detector/lane/perf 정보를 덧그린다. */
     overlay_results(app, app->memory.map_base_output[output_idx]);
 
-    /* ???????? ?????overlay/display ????????????????? */
+    /* 완성된 출력 버퍼를 overlay/display 장치에 실제로 보여준다. */
     if (display_show(app->display, app->memory.phy_base_output[output_idx], app->display_x,
                      app->display_y, app->display_width, app->display_height) != 0) {
         return -1;
@@ -189,4 +240,3 @@ int render_output_frame(app_context_t *app)
     app->display_buffer_index++;
     return 0;
 }
-

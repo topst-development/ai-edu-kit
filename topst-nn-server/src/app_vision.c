@@ -139,7 +139,13 @@ int app_vision_recv_frame(app_context_t *app)
                                   &virtual_addr,
                                   &base_offset,
                                   &sync_stamp);
+    if (ret == TIMEOUT_ERROR || ret == QUEUE_UNDERFLOW) {
+        return 0;
+    }
     if (ret != 0) {
+        if (app->stop) {
+            return 0;
+        }
         fprintf(stderr, "[vision] MessagePopReceiveBuffer failed: %d\n", ret);
         return -1;
     }

@@ -45,6 +45,7 @@
 /* ========================================================================== */
 #define VISION_PROTOCOL_STREAM_QUEUE_COUNT 4
 #define VISION_PROTOCOL_CTRL_QUEUE_COUNT 6
+#define VISION_PROTOCOL_RECV_POLL_TIMEOUT_MS 100
 
 /* ========================================================================== */
 /*                       Internal Function Declarations                       */
@@ -379,29 +380,27 @@ int32_t MessagePopReceiveBuffer(MessageHandle handle, uint8_t **virtualAddr, uin
 		uint8_t bufIndex = pContext->recvBufferCount;
 		vision_stream_info_t *popInfo;
 
-		while(1)
+		ret = Vision_API_RecvStream(pContext->streamHandle, &popInfo, &bufIndex,
+									VISION_PROTOCOL_RECV_POLL_TIMEOUT_MS);
+		if (ret != VISION_SUCCESS)
 		{
-			ret = Vision_API_RecvStream(pContext->streamHandle, &popInfo, &bufIndex, BLOCKING);
-			if ((ret == 0) && (bufIndex < pContext->recvBufferCount))
-			{
-				if (popInfo->pBuffer == pContext->pmRecvBuffer[bufIndex].virAddr)
-				{
-					*virtualAddr = pContext->pmRecvBuffer[bufIndex].virAddr;
-					*baseOffset = pContext->pmRecvBuffer[bufIndex].phyAddr;
-					*syncStamp = popInfo->seqNum;
-					pContext->popInfo[bufIndex] = popInfo;
-					break;
-				}
-				else
-				{
-					printf("[%s] Return buffer doesn't match with buffer at index\n", __FUNCTION__);
-				}
-			}
-			else
-			{
-				printf("[%s] Invalid buffer index\n", __FUNCTION__);
-			}
+			return ret;
 		}
+		if ((bufIndex >= pContext->recvBufferCount) || (popInfo == NULL))
+		{
+			printf("[%s] Invalid buffer index\n", __FUNCTION__);
+			return VISION_ERROR;
+		}
+		if (popInfo->pBuffer != pContext->pmRecvBuffer[bufIndex].virAddr)
+		{
+			printf("[%s] Return buffer doesn't match with buffer at index\n", __FUNCTION__);
+			return VISION_ERROR;
+		}
+
+		*virtualAddr = pContext->pmRecvBuffer[bufIndex].virAddr;
+		*baseOffset = pContext->pmRecvBuffer[bufIndex].phyAddr;
+		*syncStamp = popInfo->seqNum;
+		pContext->popInfo[bufIndex] = popInfo;
 	}
 	else
 	{

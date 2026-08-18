@@ -81,9 +81,6 @@ int app_runtime_init(app_context_t *app)
     if (app_input_init(app) != 0) {
         if (app->input_mode == APP_INPUT_TCP) {
             fprintf(stderr, "tcp input init failed on port %d\n", app->tcp_input.port);
-        } else if (app->input_mode == APP_INPUT_VISION) {
-            fprintf(stderr, "vision input init failed target=%s stream=%d message=%d\n",
-                    app->vision.target_ip, app->vision.stream_port, app->vision.message_port);
         } else {
             fprintf(stderr, "app_input_init failed\n");
         }
